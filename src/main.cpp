@@ -1,35 +1,33 @@
 // =====================================================================
 // GTA SA Cliente Multijugador - Android (AML v1.2.4)
-// v0.34-stability (Hito 4 polish: estabilidad de remotos)
+// v0.35-quietdemo (cliente "dormido" hasta que llega un remoto real)
 //
-// VICTORIA EN v0.33:
-//   - Multiplayer real funcionando: parser PLAYERS, map<id, RemotePlayer>
-//   - Self-healing cuando ped muere por streaming
-//   - 1 remoto estable confirmado en log + screenshot
+// VICTORIA EN v0.34:
+//   - Filtro auto-echo por nombre: confirmado en log, ya no aparece
+//     la sesion zombie del mismo user (id=111 name=rcblackmex).
+//   - Repopulate del free pool: confirmado, se reactiva cuando baja
+//     de 3 peds y agrega los nuevos sin duplicar.
+//   - Tether: codeado pero no probado (no hubo remotos en la sesion).
 //
-// PROBLEMAS OBSERVADOS EN v0.33 (a solucionar en v0.34):
-//   A) Peds mueren por streaming cuando el remoto esta >~40m del CJ.
-//      El game los libera del pool, vimos hasta 4 reemplazos en 100ms
-//      hasta encontrar uno estable. Glitch visible al user.
-//   B) Server broadcastea PLAYERS con id=111 name=rcblackmex (mismo
-//      nombre que g_MyId=110): sesion zombie del propio user. Filtrar
-//      por nombre tambien, no solo por id.
-//   C) Cuando el free pool se vacia, no podemos asignar mas peds a
-//      nuevos remotos. Hay que re-iterar el pool periodicamente para
-//      reponer.
+// MOTIVO DEL CAMBIO v0.35:
+//   En v0.33-0.34 cuando no hay remotos, el cliente metia 8 peds del
+//   pool en un circulo demo arriba del CJ. Cuando RepopulateFreePool
+//   se activo (v0.34), agarraba peatones NUEVOS que estaban caminando
+//   por la calle y los lanzaba al aire (peatones colgados de cables,
+//   boca abajo, etc). Visualmente ridiculo cuando estas jugando solo.
 //
-// PLAN v0.34 - STABILITY:
-//   1. Filtro auto-echo por nombre: si name == PLAYER_NAME, ignorar
-//      siempre (es otra sesion del mismo user).
-//   2. Tether anti-streaming: si remote.pos esta a >kTetherDistance
-//      (40m) del CJ, NO escribir la pos real, escribir un punto a
-//      ~30m del CJ en la direccion del remoto. Asi el ped no sale
-//      del rango de streaming y sobrevive.
-//   3. Re-populate free pool: cuando g_FreePeds.size() < 3, re-iterar
-//      el pool en el siguiente tick para reponer peds disponibles.
-//   4. WritePedPos: cuando un ped muere, ya NO lo metemos al free pool
-//      (estaba mal en v0.33: en FreeRemotePed se devolvia el ped
-//      incondicionalmente; ahora distinguimos timeout vs muerte).
+// PLAN v0.35 - QUIETDEMO:
+//   1. Eliminar el demo hover circular. Si no hay remotos, no tocamos
+//      ningun ped, el game maneja los peatones normalmente.
+//   2. Iteracion inicial del pool sigue para validar que el sistema
+//      funciona y precargar g_FreePeds, pero NO se escribe nada al
+//      free pool hasta que llegue un remoto.
+//   3. RepopulateFreePool solo se dispara si hay remotos sin ped
+//      esperando (antes se disparaba siempre que free<3 y reponia
+//      peds que nadie iba a usar).
+//   4. Log de estado distingue modo IDLE (sin remotos) vs ACTIVE
+//      (con remotos), para que sea facil ver desde el log que el
+//      sistema esta vivo pero dormido.
 //
 // Server: yamanote.proxy.rlwy.net:19365 (Railway TCP proxy)
 // =====================================================================
@@ -77,8 +75,6 @@ static const char*    SERVER_HOST = "yamanote.proxy.rlwy.net";
 static const uint16_t SERVER_PORT = 19365;
 static const char*    PLAYER_NAME = "rcblackmex";
 
-static const float kCircleRadius   = 6.0f;
-static const float kHoverZ         = 5.0f;
 static const int   kHoverTickMs    = 100;
 static const int   kInitialWaitS   = 20;
 static const int64_t kRemoteTimeoutMs = 30000; // 30s sin update -> drop
@@ -105,7 +101,7 @@ extern "C" {
         "com.rcblackmex.gtasaclient",
         "GTA SA Cliente MP",
         "rcblackmex",
-        "0.34-stability"
+        "0.35-quietdemo"
     };
     ModInfo* __GetModInfo() { return &modinfo; }
 }
@@ -432,19 +428,13 @@ static void RepopulateFreePool() {
 }
 
 // ---------------------------------------------------------------------
-// HOVER demo circulo (para peds NO asignados a remotos)
+// HOVER demo circulo (DEPRECATED en v0.35: ya no se usa el demo hover.
+// El sistema queda IDLE cuando no hay remotos. Mantengo la struct y
+// el array fuera del codigo para no perder la idea por si se quiere
+// reactivar en debug.)
 // ---------------------------------------------------------------------
-struct SlotPos { const char* label; float dx, dy; };
-static const SlotPos kCircle[8] = {
-    {"N ",  0.000f,  +6.000f},
-    {"NE", +4.243f,  +4.243f},
-    {"E ", +6.000f,   0.000f},
-    {"SE", +4.243f,  -4.243f},
-    {"S ",  0.000f,  -6.000f},
-    {"SW", -4.243f,  -4.243f},
-    {"W ", -6.000f,   0.000f},
-    {"NW", -4.243f,  +4.243f},
-};
+// struct SlotPos { const char* label; float dx, dy; };
+// static const SlotPos kCircle[8] = { ... };
 
 // Escribe pos a la matrix de un ped, validando primero IsPedPointerValid.
 // Retorna false si el ped ya no es valido (game lo libero).
@@ -471,14 +461,6 @@ static void TickAllPositions(float cjX, float cjY, float cjZ) {
     std::lock_guard<std::mutex> lk(g_RemoteMutex);
     int64_t now = NowMs();
 
-    // 0. v0.34: si el free pool esta bajo, intentar re-poblar (throttle 5s)
-    static int64_t lastRepop = 0;
-    if (g_FreePeds.size() < kMinFreePeds && (now - lastRepop) > 5000) {
-        LOGI("[POOL] free=%zu < %zu, re-poblando...", g_FreePeds.size(), kMinFreePeds);
-        RepopulateFreePool();
-        lastRepop = now;
-    }
-
     // 1. Remotos: cleanup timeout primero
     std::vector<int> toRemove;
     for (auto& kv : g_Remotes) {
@@ -490,15 +472,35 @@ static void TickAllPositions(float cjX, float cjY, float cjZ) {
     }
     for (int id : toRemove) g_Remotes.erase(id);
 
-    // 2. Asignar peds a remotos sin ped (si hay libres)
+    // 2. v0.35: si NO hay remotos, no hacemos NADA mas. Modo IDLE.
+    //    Asi el game maneja los peatones normalmente, no volamos a nadie.
+    if (g_Remotes.empty()) {
+        return;
+    }
+
+    // 3. Contar remotos sin ped asignado: si los hay y free pool esta bajo,
+    //    re-poblar (throttle 5s). v0.35: solo si HAY demanda real.
+    int waiting = 0;
+    for (const auto& kv : g_Remotes) {
+        if (!kv.second.ped.pedPtr) waiting++;
+    }
+    static int64_t lastRepop = 0;
+    if (waiting > 0 && g_FreePeds.size() < kMinFreePeds && (now - lastRepop) > 5000) {
+        LOGI("[POOL] free=%zu < %zu y hay %d remotos esperando ped, re-poblando...",
+             g_FreePeds.size(), kMinFreePeds, waiting);
+        RepopulateFreePool();
+        lastRepop = now;
+    }
+
+    // 4. Asignar peds a remotos sin ped (si hay libres)
     for (auto& kv : g_Remotes) {
         if (!kv.second.ped.pedPtr) TryAssignPedToRemote(kv.second);
     }
 
-    // 3. Escribir pos de cada remoto en su ped
-    //    v0.34: tether anti-streaming. Si remote.pos esta a >40m del CJ,
-    //    no escribir la pos real (el game soltaria el ped por streaming).
-    //    En su lugar, colocar el ped a 30m del CJ en la direccion del remoto.
+    // 5. Escribir pos de cada remoto en su ped (con tether anti-streaming)
+    //    v0.34: si remote.pos esta a >kTetherDistance del CJ, no escribir
+    //    la pos real (el game soltaria el ped por streaming); colocar el
+    //    ped a kTetherTargetDist del CJ en la direccion del remoto.
     for (auto& kv : g_Remotes) {
         RemotePlayer& r = kv.second;
         if (!r.ped.pedPtr) continue;
@@ -510,12 +512,10 @@ static void TickAllPositions(float cjX, float cjY, float cjZ) {
 
         float target[3];
         if (dist > kTetherDistance && dist > 0.01f) {
-            // Tether: colocar a 30m del CJ en la direccion del remoto,
-            // pero conservando la Z del remoto (suelo / altura).
             float scale = kTetherTargetDist / dist;
             target[0] = cjX + dx * scale;
             target[1] = cjY + dy * scale;
-            target[2] = cjZ + dz * scale;  // tambien escalada para Z
+            target[2] = cjZ + dz * scale;
             r.tethered = true;
         } else {
             target[0] = r.pos[0];
@@ -527,32 +527,10 @@ static void TickAllPositions(float cjX, float cjY, float cjZ) {
         if (!WritePedPos(r.ped, target)) {
             LOGW("[REMOTE] ped 0x%lx (id=%d %s) murio, soltando referencia",
                  (unsigned long)r.ped.pedPtr, r.id, r.name.c_str());
-            // v0.34: NO devolvemos el ped al free pool: ya murio en el engine.
             r.ped = PedSlot{};
         }
     }
-
-    // 4. Demo hover: peds que sobran (FreePool) van al circulo arriba del CJ
-    size_t n = std::min((size_t)8, g_FreePeds.size());
-    std::vector<PedSlot> stillAlive;
-    stillAlive.reserve(g_FreePeds.size());
-    for (size_t i = 0; i < g_FreePeds.size(); i++) {
-        if (i < n) {
-            const SlotPos& s = kCircle[i];
-            float target[3] = { cjX + s.dx, cjY + s.dy, cjZ + kHoverZ };
-            if (WritePedPos(g_FreePeds[i], target)) {
-                stillAlive.push_back(g_FreePeds[i]);
-            } else {
-                LOGW("[DEMO] ped 0x%lx murio, descartando",
-                     (unsigned long)g_FreePeds[i].pedPtr);
-            }
-        } else {
-            // Sobran (>8): los dejamos quietos en el pool pero validamos
-            // que sigan vivos
-            stillAlive.push_back(g_FreePeds[i]);
-        }
-    }
-    g_FreePeds = std::move(stillAlive);
+    // v0.35: ya NO hay demo hover. g_FreePeds queda quieto, el game lo maneja.
 }
 
 // ---------------------------------------------------------------------
@@ -732,10 +710,9 @@ static void* AttackThreadFn(void*) {
     }
 
     LOGI("================================================================");
-    LOGI("[ATK] >>> SISTEMA MULTIPLAYER LISTO <<<");
-    LOGI("[ATK] %zu peds disponibles para asignar a remotos.", peds.size());
-    LOGI("[ATK] Sin remotos -> demo hover circular sobre el CJ.");
-    LOGI("[ATK] Con remotos -> peds se mueven a la pos real de cada amigo.");
+    LOGI("[ATK] >>> SISTEMA MULTIPLAYER LISTO (modo QUIETDEMO) <<<");
+    LOGI("[ATK] %zu peds en cache. Sin remotos: cliente IDLE (no toca peds).", peds.size());
+    LOGI("[ATK] Cuando llegue un remoto: hijack + tether anti-streaming.");
     LOGI("================================================================");
 
     int64_t lastLog = NowMs();
@@ -756,8 +733,9 @@ static void* AttackThreadFn(void*) {
                 if (kv.second.ped.pedPtr) withPed++;
                 if (kv.second.tethered)   tethered++;
             }
-            LOGI("[ATK] [state] %zu remotos (%d con ped, %d tethered), %zu peds libres, CJ=(%.1f,%.1f,%.1f)",
-                 g_Remotes.size(), withPed, tethered, g_FreePeds.size(), cjX, cjY, cjZ);
+            const char* mode = g_Remotes.empty() ? "IDLE" : "ACTIVE";
+            LOGI("[ATK] [state-%s] %zu remotos (%d con ped, %d tethered), %zu peds en cache, CJ=(%.1f,%.1f,%.1f)",
+                 mode, g_Remotes.size(), withPed, tethered, g_FreePeds.size(), cjX, cjY, cjZ);
             lastLog = now;
         }
         usleep(kHoverTickMs * 1000);
@@ -861,7 +839,7 @@ extern "C" void OnModLoad(void*) {
     pthread_create(&g_AttackThread, nullptr, AttackThreadFn, nullptr);
 
     LOGI("Cliente listo. En %ds arranca el sistema multiplayer.", kInitialWaitS);
-    LOGI("Demo hover si no hay remotos. Cuando lleguen amigos veras sus peds.");
+    LOGI("Sin remotos: cliente IDLE. Con remotos: aparecen como peatones.");
 }
 
 extern "C" void OnModUnload() {
