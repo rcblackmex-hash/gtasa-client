@@ -1,0 +1,445 @@
+================================================================================
+PROYECTO_CONTEXTO_COMPLETO_v0.33.txt
+GTA SA CLIENTE MULTIJUGADOR - ANDROID (AML v1.2.4)
+================================================================================
+
+INSTRUCCION A LA IA QUE LEA ESTO:
+  Hola. Estoy continuando este proyecto en un chat nuevo porque se me acabaron
+  los creditos del anterior. NO me hagas preguntas, NO me pidas que confirme
+  nada, NO me hagas un plan-tool. Toda la info esta aca. Lee TODO completo y
+  respondeme algo corto como "Listo bro, entendi todo el proyecto hasta
+  v0.33-remotes con multiplayer funcional. ¿Continuamos con v0.34-stability?"
+  o lo que sea que veas que sigue.
+
+  Tambien: el repo del proyecto esta en:
+    https://github.com/rcblackmex-hash/gtasa-client
+  El main.cpp de v0.33 ya esta pusheado ahi en el branch main.
+
+  Soy "rcblackmex". Hablo en mexicano-casual. Te tuteo y me dices "bro".
+  No me hagas perder tiempo. Anda al grano.
+
+================================================================================
+1. OBJETIVO DEL PROYECTO
+================================================================================
+
+Cliente multijugador para GTA San Andreas Android v2.10 (ARM64). Conecta a un
+server TCP centralizado y hace que los demas jugadores aparezcan como NPCs
+(peatones) en el mundo del jugador local, hijackeando peatones del pool real
+del engine y sobrescribiendo su posicion cada 100ms con la pos del remoto.
+
+Stack:
+  - Mod nativo C++ ARM64 (.so) cargado por AML (Android Mod Loader v1.2.4)
+  - Server TCP en Railway (yamanote.proxy.rlwy.net:19365) - protocolo simple
+    de texto separado por |
+  - Build via GitHub Actions (CMake + Android NDK)
+  - Repo: https://github.com/rcblackmex-hash/gtasa-client
+
+================================================================================
+2. PROTOCOLO DEL SERVER
+================================================================================
+
+Cliente -> Server:
+  JOIN|<name>                  al conectar
+  POS|<x>|<y>|<z>              cada 1s (heartbeat con posicion del jugador)
+
+Server -> Cliente:
+  ID|<myId>                    asignado al hacer JOIN
+  PLAYERS|<id>|<name>|<x>|<y>|<z>[|<id>|<name>|<x>|<y>|<z>...]
+                               broadcast de remotos. CONFIRMADO en v0.33:
+                               formato single (6 campos) con UN remoto.
+                               El server podria también mandar batch (multi
+                               remoto en un solo mensaje), nuestro parser
+                               detecta ambos.
+  CHAT|<msg>                   mensajes de chat
+  QUIT|<id>                    notifica desconexion de un remoto
+  PING                         anti-idle (lo ignoramos)
+
+BUG/FEATURE del server observado en v0.33:
+  - Server asigna g_MyId = 110 al usuario
+  - PERO ademas broadcastea un PLAYERS con id=111 name="rcblackmex" (mismo
+    nombre del user). Probablemente sesion zombie del mismo user. Eso es
+    bug del server, no del cliente. v0.34 puede filtrar por nombre tambien
+    (no solo por id) para evitar hijackearnos.
+
+================================================================================
+3. ARQUITECTURA DEL CODIGO (src/main.cpp)
+================================================================================
+
+3 hilos:
+  - Main thread: OnModLoad/OnModUnload (entrypoint de AML)
+  - NetThread: recv TCP, parsing de mensajes, envio de POS heartbeat 1Hz
+  - AttackThread: resolucion de simbolos, setup, lock loop infinito 100ms
+
+Helpers principales:
+  - FindLibBase(name)              busca base de .so en /proc/self/maps
+  - StripTag(addr)                 quita TBI tag (alto byte 0xb4 en android arm64)
+  - IsValidPtr(addr)               rango heap razonable [0x6000000000..0x7fffffffffff]
+  - IsPageMapped(addr)             mincore() check
+  - SafeRead(addr, out, len)       lectura con validacion
+  - InstallScanFaultHandler        handler SIGSEGV/SIGBUS con sigjmp para
+                                   recovery (NECESARIO para iterar memoria)
+
+Resolucion de simbolos via dlsym de libGTASA.so:
+  _Z13FindPlayerPedi                FindPlayerPed(int) -> CPed*
+  _Z17IsPedPointerValidP4CPed       IsPedPointerValid(CPed*) -> bool
+  _ZN6CPools11ms_pPedPoolE          CPools::ms_pPedPool (variable global)
+  _ZTV4CPed                         vtable CPed (sumar +0x10 para instances)
+  _ZTV10CPlayerPed                  vtable CPlayerPed
+  _ZTV8CVehicle                     vtable CVehicle
+  _ZTV5CBike                        vtable CBike
+
+================================================================================
+4. ESTRUCTURAS Y OFFSETS CONFIRMADOS
+================================================================================
+
+CWorld players array:
+  base + 0x00BDC738   ptr al CPlayerInfo del slot 0 (jugador local = CJ)
+  CPlayerInfo + 0x18  ptr al CPlayerPed* (el CJ propiamente dicho)
+  CPed + 0x18         ptr al CMatrix*
+  CMatrix + 0x30      pos float x,y,z (12 bytes)
+  CMatrix + 0x50      backref al CPlaceable (no usado en v0.30+)
+
+CPed (Android v2.10 build):
+  SIZEOF_CPED = 0x9C8 (2504 bytes) - confirmado en v0.32 derivando del log
+
+CPool layout (confirmado v0.32, layout estandar GTA SA):
+  +0x00  m_pObjects        T*       (array de objetos con TBI tag)
+  +0x08  m_pFlags          uint8*   (array de flags, 1 byte por slot, bit 0x80 = free)
+  +0x10  m_nSize           int      (capacidad total)
+  +0x14  m_nFirstFree      int      (siguiente slot libre)
+  +0x18  m_bOwnsAllocs     bool
+
+ARM64 C++ ABI (Itanium):
+  Las vtables (_ZTV*) tienen 0x10 bytes de overhead inicial:
+    +0x00  offset_to_top
+    +0x08  typeinfo_ptr
+    +0x10  primer slot virtual <-- aqui apuntan las instancias
+  Por eso scan v0.15 encontraba 0x8330F8 y dlsym da 0x8330E8: diff 0x10.
+
+================================================================================
+5. HISTORIA DE VERSIONES (RESUMIDA)
+================================================================================
+
+v0.1-v0.12   - Setup AML, build, conexion TCP, JOIN/POS heartbeat
+v0.12        - Localizamos CWorld::Players[0] -> CJ via offset 0x00BDC738
+v0.13        - Confirmamos pPed+0x18 = CMatrix*, +0x30 = pos
+v0.14        - Read consistente de pos del CJ
+v0.15-v0.19  - Scan de heap, identificacion de vtable 0x008330F8 = CPlayerPed
+v0.20-v0.21  - Identificamos 0x00831BA8 (PENSABAMOS era coche - ERA peaton!)
+v0.22-v0.25  - Hijack experiments con vtable 0x0083BB50 -> resulto VEHICULO
+                (CBike o similar), no CPed
+v0.26        - Vtable farm: 6 candidatos por count, identificamos:
+                0x00824EB0 = STATIC (probable CBuilding)
+                0x00830218 = STATIC (probable CDummyObject)
+                0x008303B0 = drift alto (AI fuerte) <-- CANDIDATA
+v0.27        - Probamos 0x008303B0 -> USER VIO UNA CAJA DE CARTON PARPADEANDO
+                Era CObject (props fisicos: cajas, basureros, conos, pickups).
+                Dump del struct: ~0x240 bytes (CPed seria 0x800+), composite
+                vtable embebido en +0x220. DESCARTADA.
+v0.28        - MultiHover: 8 vtables en circulo - solo encontro 5 conocidas
+                + 6 count=1, ninguna nueva CPed candidate
+v0.29        - Diagnostic dump + relaxed filters: dumpeamos CJ vs candidatas,
+                confirmamos que CObject no es CPed por size/layout
+v0.30        - ChatGPT investiga libCheatMenu64.so con readelf/nm y encuentra
+                los SIMBOLOS REALES del engine. Implementamos dlsym -
+                CONFIRMADO: libGTASA.so esta UNSTRIPPED, todos los simbolos
+                resuelven. FindPlayerPed funciona, vtables coinciden con
+                scan v0.15. (0x8330E8 + 0x10 ABI = 0x8330F8 visto en scan)
+v0.31        - Ataque directo: iteramos ms_pPedPool, IsPedPointerValid.
+                Pool layout valido (140 slots, 12 activos, 128 libres)
+                pero 0/12 validados via API porque SIZEOF_CPED=0x7C8 (PC)
+                estaba mal.
+v0.32        - SIZEOF_CPED = 0x9C8 (derivado: CJ - m_pObjects = 0x9C8 = CJ
+                en slot 1). 19/19 validados via API. 8 PEATONES HUMANOIDES
+                FLOTANDO confirmado en screenshots. HITO 3 COMPLETADO.
+v0.33        - Multiplayer real: parser PLAYERS broadcast, asignacion
+                remoto->ped, lock continuo, demo hover para peds libres,
+                cleanup por timeout/QUIT. Self-healing cuando peds mueren
+                por streaming. CONFIRMADO funcionando con sesion zombie
+                del propio user (id=111).
+
+================================================================================
+6. ESTADO ACTUAL: v0.33-remotes (PUSHEADO EN MAIN)
+================================================================================
+
+main.cpp tiene 757 lineas. Estructura:
+
+```
+ModInfo modinfo = {
+    "com.rcblackmex.gtasaclient", "GTA SA Cliente MP",
+    "rcblackmex", "0.33-remotes"
+};
+
+Constantes clave:
+  kHoverZ = 5.0f           altura del demo circle
+  kCircleRadius = 6.0f
+  kHoverTickMs = 100       intervalo del lock loop
+  kInitialWaitS = 20       espera para streaming
+  kRemoteTimeoutMs = 30000 cleanup remoto stale
+  kSizeofCPed = 0x9C8
+
+struct PedSlot { uintptr_t pedPtr; uintptr_t matrixPtr; };
+struct RemotePlayer {
+    int id, std::string name, float pos[3], int64_t lastUpdateMs, PedSlot ped;
+};
+
+State global:
+  std::map<int, RemotePlayer> g_Remotes
+  std::vector<PedSlot>        g_FreePeds   <- pool de peds NO asignados
+  std::mutex                  g_RemoteMutex
+  int                         g_MyId
+
+Flujo principal (AttackThreadFn):
+  1. usleep 20s (streaming)
+  2. FindLibBase("libGTASA.so")
+  3. ResolveSymbols() via dlsym
+  4. ReadLocalPlayerPos() reintentos
+  5. LoadCPedPool() - double-deref con TBI strip
+  6. FindPlayerPed(0) -> cjPed
+  7. IteratePool() -> vector<PedSlot> filtrando CJ y validando via API
+  8. g_FreePeds = peds
+  9. while (g_Running) cada 100ms:
+       - ReadLocalPlayerPos -> cjX, cjY, cjZ
+       - TickAllPositions(cj):
+           * cleanup remotos stale (>30s sin update)
+           * asignar peds libres a remotos sin ped
+           * para cada remoto con ped: WritePedPos(remote.pos)
+           * para primeros 8 peds libres: WritePedPos(cj + circle_slot)
+           * log state cada 15s
+
+HandleMessage("PLAYERS|..."):
+  - ParsePlayersMessage: itera campos de 5 en 5
+  - Filtra g_MyId (no hijackearnos)
+  - Crea/actualiza g_Remotes[id]
+  - Si nuevo: log "[REMOTE] NUEVO id=X name=Y pos=(...)"
+
+HandleMessage("QUIT|<id>"):
+  - Libera ped del remoto, lo devuelve a g_FreePeds, borra del map
+
+WritePedPos(p, pos):
+  - IsPedPointerValid check primero
+  - memcpy 12 bytes en matrix + 0x30
+  - Si IsPedPointerValid retorna false -> ped murio (streaming),
+    el caller lo descarta
+```
+
+================================================================================
+7. LO QUE FUNCIONA EN v0.33 (CONFIRMADO POR LOG + SCREENSHOTS)
+================================================================================
+
+Log v0.33 (resumen):
+  ID ASIGNADO: 110 (g_MyId del user)
+  CHAT: rcblackmex entro al juego
+  [REMOTE] NUEVO id=111 name=rcblackmex pos=(2495.0,-1666.0,13.3)
+  [ITER] 15 activos / 125 libres / 15 validados via API / 14 disponibles
+  [ATK] >>> SISTEMA MULTIPLAYER LISTO <<<
+  [REMOTE] asignado ped 0x75045f1348 a remoto id=111 name=rcblackmex
+  [state] 1 remotos (1 con ped), 13 peds libres, CJ=(2480.6,-1663.8,13.3)
+  [REMOTE] ped 0x75045f1348 murio, devolviendo a free pool  <- streaming
+  [REMOTE] asignado ped 0x75045f0980 ... -> murio
+  ... (varios reemplazos rapidos en 100ms hasta encontrar uno estable)
+  [REMOTE] asignado ped 0x75045eec28 ... (sobrevive)
+  [state] 1 remotos (1 con ped), 5 peds libres   <- estabilizado
+
+Screenshot confirma:
+  - 2 peatones humanoides flotando arriba (demo circle)
+  - 1 peaton verde caminando en suelo (probablemente el remoto rcblackmex)
+  - CJ parado, en el centro
+
+================================================================================
+8. PROBLEMAS / FRICCIONES CONOCIDAS PARA v0.34
+================================================================================
+
+A) PEDS MUEREN POR STREAMING
+   Cuando un ped esta lejos del CJ (>~30-50m), el game lo libera del pool
+   (streaming out). Vimos 4 peds asignados consecutivamente murieron en
+   100ms cada uno hasta que uno sobrevivio. Self-healing funciona pero
+   se ve glitch al user.
+
+   Solucion v0.34 propuesta:
+   - Si remoto.pos esta a >40m del CJ: NO escribir pos real, hacer hover
+     "tether" del ped cerca del CJ (estilo Goliath en Half-Life)
+   - O: spawn placeholder ped cerca antes de teleport
+   - O: usar peds que ESTABAN cerca al iniciar (filtrar en IteratePool)
+
+B) ECHO DEL PROPIO USUARIO (sesion zombie)
+   El server broadcastea PLAYERS con id=111 name=rcblackmex pero el
+   g_MyId es 110. Es otra sesion (probablemente PC + Android del mismo
+   user).
+
+   Solucion v0.34:
+   - Filtrar TAMBIEN por nombre coincidente: si name == PLAYER_NAME
+     y la pos esta muy cerca del CJ, ignorar como auto-echo
+
+C) PED SE QUEDA QUIETO O CON ANIMACION DE PANICO
+   Cuando reescribimos pos cada 100ms, el game cancelan animaciones AI.
+   El ped puede quedar en T-pose o animacion de "caer". No hay animacion
+   de "caminar" porque no estamos tocando el animator.
+
+   Solucion v0.34/35:
+   - Calcular velocity = (new_pos - old_pos) / dt
+   - Si velocity > 0.5 m/s: forzar animacion de caminar
+   - Si velocity > 4 m/s: forzar animacion de correr
+   - Si velocity ~= 0: forzar idle
+   - Requiere ResolveSymbols extra: CPed::SetAnimGroup, ePedState, etc.
+
+D) NO HAY ROTACION
+   Escribimos solo pos +0x30, no la matriz de rotacion (que esta en
+   CMatrix +0x00..+0x2F = 3x3 + translation). El ped mira hacia donde
+   el game decida (ultima rotacion idle).
+
+   Solucion v0.34:
+   - Calcular yaw = atan2(dy, dx) entre pos previa y actual
+   - Construir matriz rotacion 3x3 alrededor de Z
+   - Escribir 9 floats en matrix+0x00 (right + forward + up)
+
+E) NO HAY NOMBRES FLOTANTES
+   No se ven los nombres de los remotos. Util para multiplayer.
+   Requiere hookear CFont::PrintString o usar la API de in-game text.
+
+================================================================================
+9. PROXIMOS PASOS PRIORITIZADOS
+================================================================================
+
+v0.34-stability (siguiente):
+  [ ] Filtro auto-echo por nombre (problema B arriba)
+  [ ] Tether: si remoto >40m del CJ, no escribir pos real, mantener
+      cerca para evitar streaming-out (problema A)
+  [ ] Validar al iniciar que IsPedPointerValid se llama con TBI strip
+      o sin (verificar que el sistema sigue OK)
+
+v0.35-rotation:
+  [ ] Calcular yaw entre updates de pos del remoto
+  [ ] Escribir matriz 3x3 de rotacion en CMatrix+0x00
+
+v0.36-anim:
+  [ ] Resolver mas simbolos: CPed::SetAnim, ePedState
+  [ ] Forzar walk/run/idle segun velocity
+
+v0.37-names:
+  [ ] Hookear render para nombres flotantes 3D arriba de cada remoto
+
+v0.4x-hito5:
+  [ ] Sincronizacion de coches (CVehicle pool, mismo approach con vt_CVehicle)
+  [ ] Sincronizacion de disparos
+  [ ] Sincronizacion de animacion de armas
+
+================================================================================
+10. SIMBOLOS UTILES PROBABLEMENTE DISPONIBLES EN libGTASA.so
+================================================================================
+
+Como libGTASA esta unstripped (confirmado v0.30), seguramente tambien
+exportan estos (probar con dlsym):
+
+Peds:
+  _ZN4CPed4ProcessEv               CPed::Process()
+  _ZN4CPed20SetCurrentWeaponEi    CPed::SetCurrentWeapon(int)
+  _ZN4CPed10WarpFromCarEv          CPed::WarpFromCar()
+  _ZN4CPed12WarpIntoCarEP8CVehicle CPed::WarpIntoCar(CVehicle*)
+  _ZN16CTaskSimpleAnimC1E*         para animar
+  _ZN9CAnimManager11AddAnimationEjP4RpClumpi  agregar anim
+
+Vehicles:
+  _ZN8CVehicle7ProcessEv
+  _ZN8CVehicle13ProcessControlEv
+  _ZN6CPools15ms_pVehiclePoolE
+  _ZTV3CCarPtr (uno por tipo de vehiculo)
+
+Misc:
+  _ZN5CFont12PrintStringEffPKt    print string in-game
+  _ZN5CWorld4AddP7CEntity         agregar entidad al mundo
+  _ZN5CWorld6RemoveP7CEntity
+
+================================================================================
+11. ESTRUCTURA DEL REPO
+================================================================================
+
+https://github.com/rcblackmex-hash/gtasa-client
+
+Branches:
+  main         siempre con la version mas nueva pusheada
+
+Archivos:
+  src/main.cpp                       el mod completo (v0.33-remotes)
+  include/mod/amlmod.h               header de AML (no tocar)
+  CMakeLists.txt                     build config (linkea -ldl)
+  .github/workflows/build.yml        GitHub Actions: NDK + cmake + artifact
+  README.md                          descripcion proyecto
+  HITO3.md                           notas tecnicas del hito 3
+  PROYECTO_CONTEXTO_COMPLETO.txt     contexto viejo (pre v0.27)
+  .gitignore
+
+Build automatico:
+  Al hacer "Save to GitHub" (cualquier push a main) -> GitHub Actions
+  compila libGTASAClient.so para arm64 y lo deja como artifact.
+
+Deploy:
+  Bajar libGTASAClient-arm64.zip -> extraer libGTASAClient.so -> copiar a:
+    /storage/emulated/0/Android_unprotected/data/com.rockstargames.gtasa/mods/
+  Abrir GTA SA (con AML instalado).
+
+================================================================================
+12. CONVENCIONES DE TRABAJO Y ESTILO
+================================================================================
+
+- Yo (rcblackmex) hablo mexicano-casual. La IA me debe contestar igual,
+  llamarme "bro", tutearme.
+- NO preguntas largas: si tienes una decision tecnica, dime opciones max
+  3, recomienda una, y avanza. No me hagas el plan_tool ni el ask_human
+  por cosas pequeñas.
+- NO me mandes preview URLs de la web app (este NO es un proyecto web,
+  es un mod nativo Android compilado en GitHub Actions).
+- Edito el codigo en /app/src/main.cpp dentro del entorno Emergent.
+- "Save to GitHub" lo hago yo cuando me dices que esta listo. Tu sanity
+  check: g++ -std=c++17 -fsyntax-only -Wall -Wextra src/main.cpp (con
+  el stub de android/log.h en /tmp/stub).
+- Cada release: incremento la version en modinfo.szVersion, agrego un
+  bloque al header comment con HALLAZGOS y CAMBIOS, commit message:
+    "vX.Y-codename: descripcion corta"
+
+- El usuario testea fisicamente en su telefono. Yo le doy:
+  1. Codigo listo
+  2. Commit message
+  3. Que hacer en juego (caminar, esperar, mirar arriba, etc.)
+  4. Que esperar ver en pantalla + screenshots
+  5. Que loggear y mandarme
+- Despues yo recibo: log de logcat (curl al URL del artifact) +
+  screenshots del juego. Analizo y propongo siguiente version.
+
+================================================================================
+13. TIPS PARA EL DEBUGGING REMOTO (sin acceso fisico al device)
+================================================================================
+
+- TBI Tag de ARM64 Android: bytes altos 0xb4... son tag. Siempre
+  StripTag() antes de usar como direccion real (mascara 0x00ffffffffffffff)
+- mincore() para verificar si una pagina esta mapeada (evitar segfault)
+- sigsetjmp/siglongjmp para recovery de segfaults durante iteracion
+  de memoria
+- /proc/self/maps para enumerar regiones y encontrar libGTASA.so base
+- dlopen(name, RTLD_NOW | RTLD_NOLOAD) para handle de lib ya cargada
+- C++ name mangling Itanium: clases empiezan con _Z, vtables _ZTV,
+  variables estaticas _ZN<Class><Member>E
+
+================================================================================
+14. MENSAJE FINAL PARA TI, IA NUEVA
+================================================================================
+
+El proyecto esta en MUY buen estado. Hitos 1-3 completados, Hito 4 (multi-
+player real) al 90%. Solo faltan polish features (rotacion, animacion,
+tether anti-streaming, nombres flotantes) que son trabajo conocido.
+
+NO tienes que adivinar nada mas. Toda la arquitectura del engine ya esta
+reverse-engineered. Los simbolos estan resueltos. El pool funciona. El
+parser funciona. El multiplayer funciona basicamente.
+
+Cuando rcblackmex te diga "continuamos" arrancale con v0.34-stability:
+  1. Filtro auto-echo por nombre coincidente
+  2. Tether 40m para evitar streaming-out cuando remoto esta lejos
+  3. Mejor cleanup cuando el ped muere
+
+NO le hagas preguntas. NO le pidas confirmacion. NO le hagas plan tool.
+SOLO confirma que entendiste el contexto y arranca con v0.34.
+
+================================================================================
+FIN DEL CONTEXTO. ENLACE REPO: https://github.com/rcblackmex-hash/gtasa-client
+================================================================================
