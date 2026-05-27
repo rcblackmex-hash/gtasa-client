@@ -105,7 +105,7 @@ extern "C" {
         "com.rcblackmex.gtasaclient",
         "GTA SA Cliente MP",
         "rcblackmex",
-        "0.36-protocol"
+        "0.36.1-debug"
     };
     ModInfo* __GetModInfo() { return &modinfo; }
 }
@@ -589,47 +589,89 @@ static bool RemotePassesFilters(int id, const std::string& name,
     return true;
 }
 
-// Aplica una pos al remoto pendiente actual. Hace upsert en g_Remotes.
-static void ApplyPosToPending(float x, float y, float z) {
-    if (g_PendingId < 0) return;  // sin pending
-
-    if (!RemotePassesFilters(g_PendingId, g_PendingName, x, y, z)) {
+// Aplica una pos a un remoto (con upsert). Agnostico del pending state.
+static void UpsertRemote(int id, const std::string& name, float x, float y, float z) {
+    if (!RemotePassesFilters(id, name, x, y, z)) {
+        static int dbg = 0;
+        if (dbg++ < 10) {
+            LOGW("[PARSER] upsert filtrado id=%d name=%s pos=(%.1f,%.1f,%.1f) (myId=%d, myName=%s)",
+                 id, name.c_str(), x, y, z, g_MyId, PLAYER_NAME);
+        }
         return;
     }
 
     std::lock_guard<std::mutex> lk(g_RemoteMutex);
     int64_t now = NowMs();
-    auto it = g_Remotes.find(g_PendingId);
+    auto it = g_Remotes.find(id);
     bool isNew = (it == g_Remotes.end());
-    RemotePlayer& r = g_Remotes[g_PendingId];
-    r.id   = g_PendingId;
-    r.name = g_PendingName;
+    RemotePlayer& r = g_Remotes[id];
+    r.id   = id;
+    r.name = name;
     r.pos[0] = x; r.pos[1] = y; r.pos[2] = z;
     r.lastUpdateMs = now;
 
     if (isNew) {
         LOGI("[REMOTE] NUEVO id=%d name=%s pos=(%.1f,%.1f,%.1f)",
-             g_PendingId, g_PendingName.c_str(), x, y, z);
+             id, name.c_str(), x, y, z);
     }
 }
 
-// Handler de PLAYERS|id|name (siempre 3 tokens en el protocolo real)
-static void HandlePlayersAnnounce(const std::vector<std::string>& parts) {
-    if (parts.size() < 3) {
-        LOGW("[PLAYERS] formato raro: %zu campos", parts.size());
+// Aplica una pos al remoto pendiente actual (stream mode).
+static void ApplyPosToPending(float x, float y, float z) {
+    if (g_PendingId < 0) {
+        static int dbg = 0;
+        if (dbg++ < 10) LOGW("[PARSER] ApplyPos sin pending (pos=%.1f,%.1f,%.1f)", x,y,z);
         return;
     }
-    // Si quedaba un pending sin pos, lo descartamos (server bug o split raro)
-    g_PendingId   = atoi(parts[1].c_str());
-    g_PendingName = parts[2];
+    UpsertRemote(g_PendingId, g_PendingName, x, y, z);
 }
 
-// Handler de POS|x|y|z[|next_id|next_name]
-// - los 3 numeros son la pos del player anunciado anteriormente (pending)
-// - los 2 trailing fields (si existen) anuncian al SIGUIENTE player
+// Handler PLAYERS|... - PARSER AMBIDEXTRO v0.36.1:
+// Detecta y maneja DOS formatos que usa el server segun el cliente:
+//   Stream mode: PLAYERS|id|name           (3 campos) -> setea pending,
+//                                                        espera POS subsec.
+//   Batch mode:  PLAYERS|id|name|x|y|z[|...]
+//                (1 + 5*N campos) -> aplica directamente todos los players
+//                en una sola pasada, NO usa pending.
+static void HandlePlayersAnnounce(const std::vector<std::string>& parts) {
+    // Stream mode: PLAYERS|id|name
+    if (parts.size() == 3) {
+        g_PendingId   = atoi(parts[1].c_str());
+        g_PendingName = parts[2];
+        static int dbg = 0;
+        if (dbg++ < 20) {
+            LOGI("[PARSER] stream announce id=%d name=%s",
+                 g_PendingId, g_PendingName.c_str());
+        }
+        return;
+    }
+    // Batch mode: PLAYERS|id|name|x|y|z[|id|name|x|y|z...]
+    if (parts.size() >= 6 && ((parts.size() - 1) % 5) == 0) {
+        static int dbgFirst = 0;
+        if (dbgFirst++ < 5) {
+            LOGI("[PARSER] batch mode con %zu players",
+                 (parts.size() - 1) / 5);
+        }
+        for (size_t i = 1; i + 4 < parts.size(); i += 5) {
+            int   id   = atoi(parts[i].c_str());
+            const std::string& name = parts[i+1];
+            float x    = (float)atof(parts[i+2].c_str());
+            float y    = (float)atof(parts[i+3].c_str());
+            float z    = (float)atof(parts[i+4].c_str());
+            UpsertRemote(id, name, x, y, z);
+        }
+        // En batch mode no hay state pending
+        g_PendingId = -1; g_PendingName.clear();
+        return;
+    }
+    LOGW("[PARSER] PLAYERS formato no manejado: %zu campos", parts.size());
+}
+
+// Handler POS|x|y|z[|next_id|next_name] - solo aplica en stream mode
 static void HandlePosUpdate(const std::vector<std::string>& parts) {
     if (parts.size() < 4) {
-        // POS sin x/y/z? Probablemente garbage del server. Reset.
+        static int dbg = 0;
+        if (dbg++ < 10) LOGW("[PARSER] POS sin x/y/z (%zu campos)", parts.size());
         g_PendingId = -1; g_PendingName.clear();
         return;
     }
@@ -637,15 +679,19 @@ static void HandlePosUpdate(const std::vector<std::string>& parts) {
     float y = (float)atof(parts[2].c_str());
     float z = (float)atof(parts[3].c_str());
 
-    // Aplicar pos al pending actual
+    // Aplicar pos al pending actual (si lo hay del stream mode)
     ApplyPosToPending(x, y, z);
 
-    // Si hay trailing (id+name del siguiente), setear nuevo pending
+    // Trailing (id+name del siguiente) en stream chain
     if (parts.size() >= 6) {
         g_PendingId   = atoi(parts[4].c_str());
         g_PendingName = parts[5];
+        static int dbg = 0;
+        if (dbg++ < 20) {
+            LOGI("[PARSER] chain next id=%d name=%s",
+                 g_PendingId, g_PendingName.c_str());
+        }
     } else {
-        // Fin de frame, sin mas players
         g_PendingId = -1; g_PendingName.clear();
     }
 }
@@ -682,6 +728,16 @@ static bool SendLine(const std::string& line) {
 
 static void HandleMessage(const std::string& line) {
     if (line.empty()) return;
+
+    // v0.36.1 DEBUG: loggear las primeras N lineas crudas que llegan
+    // para confirmar exactamente que manda el server. Quitar despues
+    // de validar.
+    static int g_RawLogCount = 0;
+    if (g_RawLogCount < 60) {
+        LOGI("[RAW %d] %s", g_RawLogCount, line.c_str());
+        g_RawLogCount++;
+    }
+
     auto parts = Split(line, '|');
     const std::string& cmd = parts[0];
 
