@@ -1,37 +1,42 @@
 // =====================================================================
 // GTA SA Cliente Multijugador - Android (AML v1.2.4)
-// v0.36-protocol (protocolo real del server descubierto y aplicado)
+// v0.37-pedlock-diag (fase 1: diagnostico para anti-recycle de peds)
 //
-// VICTORIA EN v0.35:
-//   - Cliente quieto cuando no hay remotos. Mundo se ve normal.
-//   - 6+ minutos manejando confirmados sin glitches.
+// VICTORIA EN v0.36.1-debug:
+//   - Parser ambidextro: maneja formato BATCH (PLAYERS|id|name|x|y|z|...)
+//     que el server usa con el cliente nativo, Y formato STREAM
+//     (PLAYERS|id|name + POS|x|y|z[|next_id|next_name]) que usa con
+//     otros clientes. Confirmado en log: "[PARSER] batch mode con 2
+//     players" + "[REMOTE] NUEVO id=143 name=testbro".
+//   - Auto-echo filter por nombre confirmado funcionando.
+//   - testbro caminando en circulo fue detectado y asignado a un ped.
 //
-// DESCUBRIMIENTO v0.36 (sniffer en tools/sniffer.py):
-//   El server NO manda PLAYERS|id|name|x|y|z como decia el contexto v0.33.
-//   El formato REAL con 2+ clientes conectados es un STREAM INTERLEAVED:
+// PROBLEMA NUEVO observado:
+//   Los peds asignados a remotos mueren cada 10-25s aunque esten a
+//   5-15m del CJ (mucho menos que kTetherDistance=40m, asi que NO
+//   es streaming). El game tiene "ped recycling": los peatones
+//   civiles son rotados periodicamente para variar el ambiente.
+//   Como nuestro hijack no marca al ped como "no-recycle", el game
+//   lo despawnea regularmente.
 //
-//       PLAYERS|<id1>|<name1>                          (1er player, sin pos)
-//       POS|<x1>|<y1>|<z1>[|<id2>|<name2>]             (pos del anterior +
-//                                                       opcional anuncia next)
-//       POS|<x2>|<y2>|<z2>[|<id3>|<name3>]             ...
-//       POS|<xN>|<yN>|<zN>                             (ultimo, sin trailing)
+//   Resultado visual: el remoto aparece/desaparece cada pocos
+//   segundos. El user NO ve un peaton estable representando a
+//   testbro.
 //
-//   El parser v0.33-v0.35 exigia >=6 campos en PLAYERS y NUNCA aceptaba
-//   POS como input, asi que NUNCA podia ver remotos reales. Por eso el
-//   campo "remotos" del log siempre dio 0 (excepto la sesion zombie de
-//   v0.33 que tenia otro origen).
+// PLAN v0.37 - PEDLOCK FASE 1 (DIAGNOSTICO):
+//   No sabemos los offsets exactos de los flags (bDontDie, bMission,
+//   m_nCreatedBy) en CPed para Android v2.10 ARM64. En vez de adivinar
+//   y romper el ped, hacemos un DUMP COMPARATIVO:
 //
-// PLAN v0.36 - PROTOCOL:
-//   1. State machine con g_PendingId/g_PendingName entre mensajes.
-//   2. HandlePlayersAnnounce: PLAYERS|id|name -> setea pending.
-//   3. HandlePosUpdate: POS|x|y|z[|nid|nname] -> aplica pos al pending,
-//      si hay trailing setea nuevo pending.
-//   4. Filtros (id == g_MyId, name == PLAYER_NAME, pos en rango) en
-//      RemotePassesFilters() reutilizable.
-//   5. Reset del pending cuando llega QUIT del id pendiente.
+//   Cuando se asigna el primer ped a un remoto, comparamos byte a byte
+//   los primeros 0x600 bytes del CJ (que NUNCA se recicla, es el
+//   player ped permanente) vs el ped civil hijackeado. Solo loggeamos
+//   las filas DIFERENTES. Esos bytes son candidatos a contener los
+//   flags responsables del reciclaje.
 //
-// Sigue funcionando v0.34 (tether, repopulate, auto-echo filter) y
-// v0.35 (modo IDLE sin remotos).
+//   Con el log del user (logcat), identificamos en v0.37.1 el offset
+//   exacto y aplicamos el fix surgical: setear el flag de "permanente"
+//   en cada ped al hijack-arlo.
 //
 // Server: yamanote.proxy.rlwy.net:19365 (Railway TCP proxy)
 // =====================================================================
@@ -105,7 +110,7 @@ extern "C" {
         "com.rcblackmex.gtasaclient",
         "GTA SA Cliente MP",
         "rcblackmex",
-        "0.36.1-debug"
+        "0.37-pedlock-diag"
     };
     ModInfo* __GetModInfo() { return &modinfo; }
 }
@@ -405,6 +410,64 @@ static bool TryAssignPedToRemote(RemotePlayer& r) {
     return true;
 }
 
+// ---------------------------------------------------------------------
+// v0.37 DIAGNOSTIC: dump comparativo del CJ vs un ped civil hijackeado.
+// El CJ NUNCA se recicla (es el player ped, marcado como permanente).
+// Los peds civiles SI se reciclan cada 10-25s. Los bytes que DIFIEREN
+// entre los dos contienen, casi seguro, los flags responsables del
+// reciclaje. Loggeamos solo las lineas donde difieren (limitamos a
+// los primeros 0x600 bytes que incluyen CEntity + CPhysical + CPed
+// flags).
+// ---------------------------------------------------------------------
+static std::atomic<bool> g_DumpDone{false};
+
+static void DumpPedComparison(uintptr_t cjStrip, uintptr_t targetStrip) {
+    if (g_DumpDone.exchange(true)) return;  // solo 1 vez
+
+    const size_t kDumpRange = 0x600;
+    const size_t kRowSize   = 16;
+    LOGI("==== DUMP COMPARATIVO CJ vs PED CIVIL (offset+0x00..+0x%zx) ====",
+         kDumpRange);
+    LOGI("==== Loggeamos SOLO las filas que difieren (foco en flags) ====");
+
+    InstallScanFaultHandler();
+    int diffRows = 0;
+    for (size_t off = 0; off < kDumpRange; off += kRowSize) {
+        uint8_t bufCj[kRowSize] = {0};
+        uint8_t bufPd[kRowSize] = {0};
+        bool ok = false;
+        g_InProtectedScan = 1;
+        if (sigsetjmp(g_FaultBuf, 1) == 0) {
+            memcpy(bufCj, (void*)(cjStrip     + off), kRowSize);
+            memcpy(bufPd, (void*)(targetStrip + off), kRowSize);
+            ok = true;
+        }
+        g_InProtectedScan = 0;
+        if (!ok) {
+            LOGW("[DUMP +0x%03zx] read fault, skip", off);
+            continue;
+        }
+
+        if (memcmp(bufCj, bufPd, kRowSize) != 0) {
+            // Render hex
+            char cjLine[64] = {0}, pdLine[64] = {0}, dfLine[64] = {0};
+            for (size_t i = 0; i < kRowSize; i++) {
+                snprintf(cjLine + i*3, 4, "%02x ", bufCj[i]);
+                snprintf(pdLine + i*3, 4, "%02x ", bufPd[i]);
+                snprintf(dfLine + i*3, 4, "%s ",
+                    (bufCj[i] != bufPd[i]) ? "^^" : "  ");
+            }
+            LOGI("[DUMP +0x%03zx] CJ:  %s", off, cjLine);
+            LOGI("[DUMP +0x%03zx] PED: %s", off, pdLine);
+            LOGI("[DUMP +0x%03zx] dif: %s", off, dfLine);
+            diffRows++;
+        }
+    }
+    RestoreScanFaultHandler();
+    LOGI("==== DUMP COMPLETE: %d filas diferentes en %zu bytes ====",
+         diffRows, kDumpRange);
+}
+
 // v0.34: re-iterar el pool y agregar peds NUEVOS (no ya asignados ni ya
 // presentes en free pool) cuando el free pool baja de kMinFreePeds.
 // CALLER must hold g_RemoteMutex.
@@ -498,7 +561,16 @@ static void TickAllPositions(float cjX, float cjY, float cjZ) {
 
     // 4. Asignar peds a remotos sin ped (si hay libres)
     for (auto& kv : g_Remotes) {
-        if (!kv.second.ped.pedPtr) TryAssignPedToRemote(kv.second);
+        if (!kv.second.ped.pedPtr) {
+            bool wasNoPed = true;
+            if (TryAssignPedToRemote(kv.second) && wasNoPed) {
+                // v0.37 DIAG: dump comparativo CJ vs primer ped asignado.
+                // Solo se ejecuta UNA vez (g_DumpDone atomic flag).
+                if (g_CjStrip != 0) {
+                    DumpPedComparison(g_CjStrip, kv.second.ped.pedPtr);
+                }
+            }
+        }
     }
 
     // 5. Escribir pos de cada remoto en su ped (con tether anti-streaming)
