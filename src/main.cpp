@@ -1,33 +1,37 @@
 // =====================================================================
 // GTA SA Cliente Multijugador - Android (AML v1.2.4)
-// v0.35-quietdemo (cliente "dormido" hasta que llega un remoto real)
+// v0.36-protocol (protocolo real del server descubierto y aplicado)
 //
-// VICTORIA EN v0.34:
-//   - Filtro auto-echo por nombre: confirmado en log, ya no aparece
-//     la sesion zombie del mismo user (id=111 name=rcblackmex).
-//   - Repopulate del free pool: confirmado, se reactiva cuando baja
-//     de 3 peds y agrega los nuevos sin duplicar.
-//   - Tether: codeado pero no probado (no hubo remotos en la sesion).
+// VICTORIA EN v0.35:
+//   - Cliente quieto cuando no hay remotos. Mundo se ve normal.
+//   - 6+ minutos manejando confirmados sin glitches.
 //
-// MOTIVO DEL CAMBIO v0.35:
-//   En v0.33-0.34 cuando no hay remotos, el cliente metia 8 peds del
-//   pool en un circulo demo arriba del CJ. Cuando RepopulateFreePool
-//   se activo (v0.34), agarraba peatones NUEVOS que estaban caminando
-//   por la calle y los lanzaba al aire (peatones colgados de cables,
-//   boca abajo, etc). Visualmente ridiculo cuando estas jugando solo.
+// DESCUBRIMIENTO v0.36 (sniffer en tools/sniffer.py):
+//   El server NO manda PLAYERS|id|name|x|y|z como decia el contexto v0.33.
+//   El formato REAL con 2+ clientes conectados es un STREAM INTERLEAVED:
 //
-// PLAN v0.35 - QUIETDEMO:
-//   1. Eliminar el demo hover circular. Si no hay remotos, no tocamos
-//      ningun ped, el game maneja los peatones normalmente.
-//   2. Iteracion inicial del pool sigue para validar que el sistema
-//      funciona y precargar g_FreePeds, pero NO se escribe nada al
-//      free pool hasta que llegue un remoto.
-//   3. RepopulateFreePool solo se dispara si hay remotos sin ped
-//      esperando (antes se disparaba siempre que free<3 y reponia
-//      peds que nadie iba a usar).
-//   4. Log de estado distingue modo IDLE (sin remotos) vs ACTIVE
-//      (con remotos), para que sea facil ver desde el log que el
-//      sistema esta vivo pero dormido.
+//       PLAYERS|<id1>|<name1>                          (1er player, sin pos)
+//       POS|<x1>|<y1>|<z1>[|<id2>|<name2>]             (pos del anterior +
+//                                                       opcional anuncia next)
+//       POS|<x2>|<y2>|<z2>[|<id3>|<name3>]             ...
+//       POS|<xN>|<yN>|<zN>                             (ultimo, sin trailing)
+//
+//   El parser v0.33-v0.35 exigia >=6 campos en PLAYERS y NUNCA aceptaba
+//   POS como input, asi que NUNCA podia ver remotos reales. Por eso el
+//   campo "remotos" del log siempre dio 0 (excepto la sesion zombie de
+//   v0.33 que tenia otro origen).
+//
+// PLAN v0.36 - PROTOCOL:
+//   1. State machine con g_PendingId/g_PendingName entre mensajes.
+//   2. HandlePlayersAnnounce: PLAYERS|id|name -> setea pending.
+//   3. HandlePosUpdate: POS|x|y|z[|nid|nname] -> aplica pos al pending,
+//      si hay trailing setea nuevo pending.
+//   4. Filtros (id == g_MyId, name == PLAYER_NAME, pos en rango) en
+//      RemotePassesFilters() reutilizable.
+//   5. Reset del pending cuando llega QUIT del id pendiente.
+//
+// Sigue funcionando v0.34 (tether, repopulate, auto-echo filter) y
+// v0.35 (modo IDLE sin remotos).
 //
 // Server: yamanote.proxy.rlwy.net:19365 (Railway TCP proxy)
 // =====================================================================
@@ -101,7 +105,7 @@ extern "C" {
         "com.rcblackmex.gtasaclient",
         "GTA SA Cliente MP",
         "rcblackmex",
-        "0.35-quietdemo"
+        "0.36-protocol"
     };
     ModInfo* __GetModInfo() { return &modinfo; }
 }
@@ -534,67 +538,115 @@ static void TickAllPositions(float cjX, float cjY, float cjZ) {
 }
 
 // ---------------------------------------------------------------------
-// Parser PLAYERS broadcast
-// Formato esperado: PLAYERS|id|name|x|y|z[|id|name|x|y|z...]
-// Auto-detecta single vs batch.
+// Parser del protocolo REAL del server (descubierto en v0.36 con
+// el sniffer tools/sniffer.py). El server NO manda PLAYERS|id|name|x|y|z
+// como decia el contexto v0.33. Manda un stream INTERLEAVED:
+//
+//   PLAYERS|<id1>|<name1>                          <- anuncia 1er player
+//   POS|<x1>|<y1>|<z1>[|<id2>|<name2>]             <- pos del anterior +
+//                                                     opcionalmente anuncia
+//                                                     al siguiente
+//   POS|<x2>|<y2>|<z2>[|<id3>|<name3>]             ...
+//   ...
+//   POS|<xN>|<yN>|<zN>                             <- ultimo (sin trailing)
+//
+// Implementacion: state machine con "pending player" entre mensajes.
+//
+// Cuando llega PLAYERS|id|name -> setear pending = (id, name)
+// Cuando llega POS|x|y|z[|next_id|next_name] ->
+//   - aplicar (x,y,z) al pending (si existe)
+//   - si trailing: pending = (next_id, next_name); sino: pending limpio
 // ---------------------------------------------------------------------
-static void ParsePlayersMessage(const std::vector<std::string>& parts) {
-    // parts[0] = "PLAYERS", el resto debe ser multiple de 5
-    if (parts.size() < 6) return;          // sin remotos en el broadcast
-    if (((parts.size() - 1) % 5) != 0) {
-        LOGW("[PLAYERS] formato no estandar: %zu campos", parts.size());
+
+// State machine del parser (solo accedido desde NetThread, no necesita mutex)
+static int         g_PendingId   = -1;
+static std::string g_PendingName;
+
+// Filtros aplicados a un remoto antes de meterlo a g_Remotes. Devuelve
+// true si pasa los filtros y debe procesarse.
+static bool RemotePassesFilters(int id, const std::string& name,
+                                float x, float y, float z) {
+    // Filtro 1: NUNCA hijackearnos a nosotros mismos por id
+    if (id == g_MyId) return false;
+
+    // Filtro 2 (v0.34): NUNCA hijackearnos por nombre coincidente
+    if (name == PLAYER_NAME) {
+        static int64_t lastEchoLog = 0;
+        int64_t nn = NowMs();
+        if (nn - lastEchoLog > 10000) {
+            LOGW("[REMOTE] auto-echo filtrado id=%d name=%s (mismo nombre que local)",
+                 id, name.c_str());
+            lastEchoLog = nn;
+        }
+        return false;
+    }
+
+    // Filtro 3: pos en rango razonable del mapa de San Andreas
+    if (x < -3500 || x > 3500 || y < -3500 || y > 3500 ||
+        z < -100  || z > 1100) {
+        return false;
+    }
+    return true;
+}
+
+// Aplica una pos al remoto pendiente actual. Hace upsert en g_Remotes.
+static void ApplyPosToPending(float x, float y, float z) {
+    if (g_PendingId < 0) return;  // sin pending
+
+    if (!RemotePassesFilters(g_PendingId, g_PendingName, x, y, z)) {
         return;
     }
 
     std::lock_guard<std::mutex> lk(g_RemoteMutex);
     int64_t now = NowMs();
-    std::set<int> seenIds;
+    auto it = g_Remotes.find(g_PendingId);
+    bool isNew = (it == g_Remotes.end());
+    RemotePlayer& r = g_Remotes[g_PendingId];
+    r.id   = g_PendingId;
+    r.name = g_PendingName;
+    r.pos[0] = x; r.pos[1] = y; r.pos[2] = z;
+    r.lastUpdateMs = now;
 
-    for (size_t i = 1; i + 4 < parts.size(); i += 5) {
-        int   id  = atoi(parts[i].c_str());
-        const std::string& name = parts[i+1];
-        float x   = (float)atof(parts[i+2].c_str());
-        float y   = (float)atof(parts[i+3].c_str());
-        float z   = (float)atof(parts[i+4].c_str());
+    if (isNew) {
+        LOGI("[REMOTE] NUEVO id=%d name=%s pos=(%.1f,%.1f,%.1f)",
+             g_PendingId, g_PendingName.c_str(), x, y, z);
+    }
+}
 
-        // Filtro 1: NUNCA hijackearnos a nosotros mismos por id
-        if (id == g_MyId) continue;
+// Handler de PLAYERS|id|name (siempre 3 tokens en el protocolo real)
+static void HandlePlayersAnnounce(const std::vector<std::string>& parts) {
+    if (parts.size() < 3) {
+        LOGW("[PLAYERS] formato raro: %zu campos", parts.size());
+        return;
+    }
+    // Si quedaba un pending sin pos, lo descartamos (server bug o split raro)
+    g_PendingId   = atoi(parts[1].c_str());
+    g_PendingName = parts[2];
+}
 
-        // Filtro 2 (v0.34): NUNCA hijackearnos por nombre coincidente.
-        // El server v0.33 tiene un bug que broadcastea sesiones zombie
-        // del mismo user con otro id pero mismo nombre. Si llega un
-        // PLAYERS con name == PLAYER_NAME, asumimos que somos nosotros
-        // y lo ignoramos para no ver un "doble" caminando con CJ.
-        if (name == PLAYER_NAME) {
-            static int64_t lastEchoLog = 0;
-            int64_t nn = NowMs();
-            if (nn - lastEchoLog > 10000) {
-                LOGW("[REMOTE] auto-echo filtrado id=%d name=%s (mismo nombre que local)",
-                     id, name.c_str());
-                lastEchoLog = nn;
-            }
-            continue;
-        }
+// Handler de POS|x|y|z[|next_id|next_name]
+// - los 3 numeros son la pos del player anunciado anteriormente (pending)
+// - los 2 trailing fields (si existen) anuncian al SIGUIENTE player
+static void HandlePosUpdate(const std::vector<std::string>& parts) {
+    if (parts.size() < 4) {
+        // POS sin x/y/z? Probablemente garbage del server. Reset.
+        g_PendingId = -1; g_PendingName.clear();
+        return;
+    }
+    float x = (float)atof(parts[1].c_str());
+    float y = (float)atof(parts[2].c_str());
+    float z = (float)atof(parts[3].c_str());
 
-        // Filtro: pos en rango razonable del mapa
-        if (x < -3500 || x > 3500 || y < -3500 || y > 3500 ||
-            z < -100 || z > 1100) {
-            continue;
-        }
+    // Aplicar pos al pending actual
+    ApplyPosToPending(x, y, z);
 
-        seenIds.insert(id);
-        auto it = g_Remotes.find(id);
-        bool isNew = (it == g_Remotes.end());
-        RemotePlayer& r = g_Remotes[id];
-        r.id   = id;
-        r.name = name;
-        r.pos[0] = x; r.pos[1] = y; r.pos[2] = z;
-        r.lastUpdateMs = now;
-
-        if (isNew) {
-            LOGI("[REMOTE] NUEVO id=%d name=%s pos=(%.1f,%.1f,%.1f)",
-                 id, name.c_str(), x, y, z);
-        }
+    // Si hay trailing (id+name del siguiente), setear nuevo pending
+    if (parts.size() >= 6) {
+        g_PendingId   = atoi(parts[4].c_str());
+        g_PendingName = parts[5];
+    } else {
+        // Fin de frame, sin mas players
+        g_PendingId = -1; g_PendingName.clear();
     }
 }
 
@@ -638,7 +690,16 @@ static void HandleMessage(const std::string& line) {
         LOGI("======== ID ASIGNADO: %d ========", g_MyId);
     }
     else if (cmd == "PLAYERS") {
-        ParsePlayersMessage(parts);
+        // v0.36: anuncia al 1er player de un frame, formato real
+        // PLAYERS|<id>|<name>
+        HandlePlayersAnnounce(parts);
+    }
+    else if (cmd == "POS") {
+        // v0.36: contiene la pos del player anunciado anteriormente y
+        // opcionalmente anuncia al siguiente. Formato real:
+        //   POS|<x>|<y>|<z>            (ultimo del frame)
+        //   POS|<x>|<y>|<z>|<id>|<nm>  (no es ultimo)
+        HandlePosUpdate(parts);
     }
     else if (cmd == "QUIT" && parts.size() >= 2) {
         int id = atoi(parts[1].c_str());
@@ -649,6 +710,8 @@ static void HandleMessage(const std::string& line) {
             FreeRemotePed(it->second);
             g_Remotes.erase(it);
         }
+        // Reset del parser pending si era este id
+        if (g_PendingId == id) { g_PendingId = -1; g_PendingName.clear(); }
     }
     else if (cmd == "CHAT" && parts.size() >= 2) {
         LOGI("<- CHAT: %s", parts[1].c_str());
